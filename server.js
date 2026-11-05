@@ -1,6 +1,7 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const https = require('https');
+const archiver = require('archiver');
 const app = express();
 
 // ==========================================
@@ -24,14 +25,14 @@ let rrIndex = 0;
 // 【ヘルパー】生存している Worker をラウンドロビンで1つ選出
 function getActiveWorker() {
     const active = workers.filter(w => w.isAlive);
-    
+
     // 万が一全滅した場合は緊急リセットして再チャレンジ（全滅セーフティ）
     if (active.length === 0) {
         console.warn('⚠️ ALL WORKERS DOWN! Emergency resetting pool...');
         workers.forEach(w => { w.isAlive = true; w.failCount = 0; });
         return workers[0];
     }
-    
+
     return active[rrIndex++ % active.length];
 }
 
@@ -50,6 +51,13 @@ function markWorkerSuccess(worker) {
     worker.failCount = 0;
     worker.isAlive = true;
 }
+
+// 通信安定化エージェント（setIntervalより先に定義）
+const proxyAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 600,
+    timeout: 60000
+});
 
 // 【バックグラウンドヘルスチェック】障害Workerの自動復帰診断（30秒周期）
 setInterval(async () => {
@@ -72,13 +80,6 @@ setInterval(async () => {
     }
 }, 30000);
 
-// 通信安定化エージェント
-const proxyAgent = new https.Agent({
-    keepAlive: true,
-    maxSockets: 600,
-    timeout: 60000
-});
-
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 // ==========================================
@@ -93,13 +94,13 @@ const AD_DOMAINS = [
     'vntsm.com'
 ];
 
-// ブラウザ内で動く強力な広告クリーナー
+// 全ページ共通：ブラウザ内で動く強力な広告クリーナー＋先読み
 const INJECT_CODE = `
 <style>
   /* 広告枠を強制非表示 */
-  iframe, .pop--excl, .bg-ssp-11557, [id*="bg-ssp"], [class*="ad-"], 
-  [style*="2147483647"], [style*="9999"], #toast { 
-    display: none !important; visibility: hidden !important; pointer-events: none !important; 
+  iframe, .pop--excl, .bg-ssp-11557, [id*="bg-ssp"], [class*="ad-"],
+  [style*="2147483647"], [style*="9999"], #toast {
+    display: none !important; visibility: hidden !important; pointer-events: none !important;
   }
   /* 続きを読むボタンを保護 */
   #load-more-chapters, .load-more, .read-more {
@@ -111,7 +112,7 @@ const INJECT_CODE = `
   (function() {
     // 1. ポップアップを殺す
     window.open = function() { return null; };
-    
+
     // 2. 動的な透明オーバーレイを監視して削除
     const nuke = () => {
       document.querySelectorAll('div, a').forEach(el => {
@@ -139,16 +140,303 @@ const INJECT_CODE = `
       }, { rootMargin: '3000px' });
       imgs.forEach(img => obs.observe(img));
     };
-    document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', prefetch) : prefetch();
+    document.readyState === 'loading'
+      ? document.addEventListener('DOMContentLoaded', prefetch)
+      : prefetch();
   })();
 </script>
 `;
 
 // ==========================================
-// 3. メインプロキシロジック（自動リトライ機能付）
+// 2b. /read?id=xxx 限定：ZIPダウンロードボタン
+// ==========================================
+const DOWNLOAD_BUTTON_CODE = `
+<script>
+(function() {
+  // ---- クライアント側でも /read?id=xxx を厳格チェック ----
+  function isReadPage() {
+    try {
+      const u = new URL(location.href);
+      return u.pathname === '/read' && u.searchParams.has('id');
+    } catch (_) { return false; }
+  }
+
+  function addDownloadButton() {
+    if (!isReadPage()) return;             // 念のためガード
+    if (document.getElementById('__zip_dl_btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = '__zip_dl_btn';
+    btn.innerHTML = '📦 ZIPダウンロード';
+    btn.style.cssText = [
+      'position:fixed', 'bottom:20px', 'right:20px',
+      'z-index:2147483647', 'padding:12px 20px',
+      'background:#3b82f6', 'color:#fff', 'border:none',
+      'border-radius:8px', 'font-size:16px', 'font-weight:bold',
+      'cursor:pointer', 'box-shadow:0 4px 12px rgba(0,0,0,.4)',
+      'font-family:sans-serif'
+    ].join(';');
+
+    btn.onclick = async () => {
+      if (!isReadPage()) { btn.remove(); return; }  // 遷移後の誤爆防止
+
+      btn.disabled = true;
+      const originalText = '📦 ZIPダウンロード';
+      btn.textContent = '⏳ 画像を収集中...';
+
+      try {
+        // 候補画像を収集（data-src優先、なければサイズでフィルタ）
+        const allImgs = Array.from(document.querySelectorAll('img'));
+        const candidates = allImgs.filter(img => {
+          const src = img.dataset.src || img.dataset.original || img.src;
+          if (!src || src.startsWith('data:') || src.startsWith('blob:')) return false;
+          if (img.dataset.src || img.dataset.original) return true;
+          return img.naturalWidth >= 200 && img.naturalHeight >= 200;
+        });
+
+        // 相対URLはプロキシ経由、外部は直接取得する形式に変換
+        const items = candidates.map(img => {
+          const raw = img.dataset.src || img.dataset.original || img.src;
+          const abs = new URL(raw, location.href);
+          if (abs.host === location.host) {
+            return { path: abs.pathname + abs.search };
+          }
+          return { url: abs.href };
+        });
+
+        // 重複除去
+        const seen = new Set();
+        const unique = items.filter(it => {
+          const k = it.path || it.url;
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+
+        if (unique.length === 0) {
+          alert('画像が見つかりませんでした');
+          btn.disabled = false; btn.textContent = originalText;
+          return;
+        }
+
+        btn.textContent = '⏳ ' + unique.length + '枚取得中...';
+
+        // ファイル名は manga_id から生成（例: read?id=12345 → manga_12345.zip）
+        const u = new URL(location.href);
+        const mangaId = (u.searchParams.get('id') || 'manga')
+          .replace(/[\\\\/:*?"<>|]/g, '_').substring(0, 40);
+        const title = 'manga_' + mangaId;
+
+        const resp = await fetch('/__download_zip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: unique, title, referer: location.href })
+        });
+
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+        const blob = await resp.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = title + '.zip';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+
+        btn.textContent = '✅ 完了!';
+        setTimeout(() => {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }, 2500);
+      } catch (e) {
+        console.error('[ZIP]', e);
+        alert('ダウンロード失敗: ' + e.message);
+        btn.disabled = false; btn.textContent = originalText;
+      }
+    };
+
+    document.body.appendChild(btn);
+  }
+
+  // SPA遷移（pushState等）で /read を外れたら隠し、戻ったら再表示
+  function syncVisibility() {
+    const btn = document.getElementById('__zip_dl_btn');
+    if (!btn) { addDownloadButton(); return; }
+    btn.style.display = isReadPage() ? 'block' : 'none';
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      addDownloadButton();
+      setInterval(syncVisibility, 1500);
+    });
+  } else {
+    addDownloadButton();
+    setInterval(syncVisibility, 1500);
+  }
+})();
+</script>
+`;
+
+// ==========================================
+// 3. 画像の拡張子判定（マジックバイト検出）
+// ==========================================
+function detectImageExt(buffer) {
+    if (!buffer || buffer.length < 12) return null;
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8) return 'jpg';
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'png';
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return 'gif';
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
+    return null;
+}
+
+// ==========================================
+// 4. ZIPダウンロードエンドポイント
+//    ※ 必ず catch-all（app.all('*')）より前に登録すること
+// ==========================================
+app.post('/__download_zip', async (req, res) => {
+    // express.raw で Buffer になっているボディを手動パース
+    let body;
+    try {
+        if (Buffer.isBuffer(req.body)) {
+            body = JSON.parse(req.body.toString('utf-8'));
+        } else if (typeof req.body === 'string') {
+            body = JSON.parse(req.body);
+        } else if (req.body && typeof req.body === 'object') {
+            body = req.body;
+        } else {
+            throw new Error('Body is empty');
+        }
+    } catch (e) {
+        return res.status(400).json({ error: 'Invalid JSON: ' + e.message });
+    }
+
+    const { items, title, referer } = body || {};
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: 'No items' });
+    }
+
+    // 有効なアイテムだけ抽出
+    const validItems = items.filter(it => it && typeof it === 'object' && (it.path || it.url));
+    if (validItems.length === 0) {
+        return res.status(400).json({ error: 'No valid items' });
+    }
+
+    const safeTitle = String(title || 'manga')
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .substring(0, 80) || 'manga';
+
+    console.log(`[ZIP] Starting download: ${validItems.length} images → "${safeTitle}.zip"`);
+
+    // ヘッダー設定（ZIPストリーミング開始）
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(safeTitle)}.zip"; filename*=UTF-8''${encodeURIComponent(safeTitle)}.zip`
+    );
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('warning', err => console.warn('[ZIP] warning:', err));
+    archive.on('error', err => {
+        console.error('[ZIP] archiver error:', err);
+        try { res.destroy(); } catch (_) {}
+    });
+    archive.pipe(res);
+
+    let successCount = 0;
+    let failCount = 0;
+
+    // ★ 順次取得（メモリ節約：1枚ずつバッファ→append→破棄）
+    for (let i = 0; i < validItems.length; i++) {
+        const item = validItems[i];
+        try {
+            let fetchUrl;
+            if (item.path) {
+                // プロキシ経由（Workerへ直接アクセス：二重プロキシ回避）
+                fetchUrl = getActiveWorker().url + item.path;
+            } else {
+                fetchUrl = item.url;
+            }
+
+            // Refererをセット（直リンクブロック対策）
+            let ref;
+            try {
+                ref = referer || new URL(fetchUrl).origin + '/';
+            } catch (_) {
+                ref = undefined;
+            }
+
+            const resp = await fetch(fetchUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    ...(ref ? { 'Referer': ref } : {})
+                },
+                agent: proxyAgent,
+                timeout: 30000,
+                redirect: 'follow',
+                compress: true
+            });
+
+            if (!resp.ok) {
+                console.warn(`[ZIP] Image ${i + 1} HTTP ${resp.status}: ${fetchUrl}`);
+                failCount++;
+                continue;
+            }
+
+            const buffer = Buffer.from(await resp.arrayBuffer());
+            if (buffer.length === 0) {
+                console.warn(`[ZIP] Image ${i + 1} empty: ${fetchUrl}`);
+                failCount++;
+                continue;
+            }
+
+            // 画像シグネチャで検証（HTMLエラーページ等を排除）
+            const ext = detectImageExt(buffer);
+            if (!ext) {
+                console.warn(`[ZIP] Image ${i + 1} not a valid image (${buffer.length} bytes)`);
+                failCount++;
+                continue;
+            }
+
+            const filename = `${String(successCount + 1).padStart(4, '0')}.${ext}`;
+            archive.append(buffer, { name: filename });
+            successCount++;
+
+            if ((i + 1) % 10 === 0) {
+                console.log(`[ZIP] Progress: ${i + 1}/${validItems.length} (${successCount} OK, ${failCount} NG)`);
+            }
+        } catch (e) {
+            console.error(`[ZIP] Image ${i + 1} error:`, e.message);
+            failCount++;
+        }
+    }
+
+    if (successCount === 0) {
+        console.error('[ZIP] No images could be fetched, destroying response');
+        try { archive.abort(); } catch (_) {}
+        try { res.destroy(); } catch (_) {}
+        return;
+    }
+
+    console.log(`[ZIP] Finalizing: ${successCount} images, ${failCount} failed`);
+    await archive.finalize();
+});
+
+// ==========================================
+// 5. メインプロキシロジック（自動リトライ機能付）
 // ==========================================
 app.all('*', async (req, res) => {
     if (req.url === '/favicon.ico') return res.status(204).end();
+
+    // ★ /read?id=xxx 判定（クエリ順序や他パラメータに強いURLパース方式）
+    let isReadPage = false;
+    try {
+        const u = new URL('http://x' + req.url);
+        isReadPage = u.pathname === '/read' && u.searchParams.has('id');
+    } catch (_) { isReadPage = false; }
 
     const maxRetries = workers.length;
     let attempt = 0;
@@ -171,13 +459,13 @@ app.all('*', async (req, res) => {
                 method: req.method,
                 headers: headers,
                 agent: proxyAgent,
-                compress: true, 
+                compress: true,
                 redirect: 'follow',
                 timeout: 12000, // 12秒応答がなければタイムアウト判定して次へ
                 body: (req.method !== 'GET' && req.method !== 'HEAD') ? req.body : undefined
             });
 
-            // 5xx (500, 502, 503, 504) のエラーは Worker の障害とみなして次の Worker へ切り替え
+            // 5xx (500, 502, 503, 504) は Worker の障害とみなして次の Worker へ切り替え
             if (response.status >= 500) {
                 console.warn(`⚠️ Worker [${worker.url}] returned HTTP ${response.status}. Retrying another worker...`);
                 markWorkerFailure(worker);
@@ -210,8 +498,9 @@ app.all('*', async (req, res) => {
                 // 2. 末尾の強制リンクを削除
                 text = text.replace(/<a[^>]*adexchangerapid\.com[^>]*>.*?<\/a>/gi, "");
 
-                // 3. 広告ブロックコードと先読みJSを注入
-                text = text.replace('<head>', '<head>' + INJECT_CODE);
+                // 3. 広告ブロックコードは常時、ZIPボタンは /read?id=xxx のみ注入
+                const inject = INJECT_CODE + (isReadPage ? DOWNLOAD_BUTTON_CODE : '');
+                text = text.replace('<head>', '<head>' + inject);
 
                 // 4. 文字化け対策
                 res.set("Content-Type", "text/html; charset=utf-8");
@@ -238,5 +527,8 @@ app.all('*', async (req, res) => {
     }
 });
 
+// ==========================================
+// 6. サーバー起動
+// ==========================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`--- ULTIMATE CLUSTER PROXY ENGINE ONLINE ---`));
+app.listen(PORT, () => console.log(`--- ULTIMATE CLUSTER PROXY ENGINE ONLINE (port ${PORT}) ---`));
