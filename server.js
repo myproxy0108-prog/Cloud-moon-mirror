@@ -93,63 +93,12 @@ const AD_DOMAINS = [
     'vntsm.com'
 ];
 
-// 全ページ共通：ブラウザ内で動く強力な広告クリーナー＋先読み
-// 全ページ共通：ブラウザ内で動く強力な広告クリーナー＋先読み
-const INJECT_CODE = `
-<style>
-  iframe, .pop--excl, .bg-ssp-11557, [id*="bg-ssp"], [class*="ad-"],
-  [style*="2147483647"], [style*="9999"], #toast {
-    display: none !important; visibility: hidden !important; pointer-events: none !important;
-  }
-  /* ★ ダウンロードボタン保護（広告削除より優先） */
-  #__zip_dl_btn {
-    display: block !important;
-    visibility: visible !important;
-    pointer-events: auto !important;
-  }
-  #load-more-chapters, .load-more, .read-more {
-    display: block !important; visibility: visible !important; opacity: 1 !important;
-    background-color: #3b82f6 !important; color: white !important;
-  }
-</style>
-<script>
-  (function() {
-    window.open = function() { return null; };
-    const nuke = () => {
-      document.querySelectorAll('div, a').forEach(el => {
-        if (el.id === '__zip_dl_btn') return;
-        const s = window.getComputedStyle(el);
-        if (parseInt(s.zIndex) > 100 && (s.opacity === '0' || s.backgroundColor.includes('0)'))) {
-          if(!el.innerText.trim()) el.remove();
-        }
-        if (el.href && (el.href.includes('adex') || el.href.includes('university'))) el.remove();
-      });
-    };
-    setInterval(nuke, 2000);
-    const prefetch = () => {
-      const imgs = Array.from(document.querySelectorAll('img[data-src]'));
-      const obs = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-          if (entry.isIntersecting) {
-            const idx = imgs.indexOf(entry.target);
-            for(let i=1; i<=5; i++) {
-              if(imgs[idx+i]) imgs[idx+i].src = imgs[idx+i].dataset.src;
-            }
-          }
-        });
-      }, { rootMargin: '3000px' });
-      imgs.forEach(img => obs.observe(img));
-    };
-    document.readyState === 'loading'
-      ? document.addEventListener('DOMContentLoaded', prefetch)
-      : prefetch();
-  })();
-</script>
-`;
-
 const DOWNLOAD_BUTTON_CODE = `
 <script>
 (function() {
+  if (window.__zipDlLoaded) return;
+  window.__zipDlLoaded = 1;
+
   function isReadPage() {
     try {
       const u = new URL(location.href);
@@ -157,7 +106,128 @@ const DOWNLOAD_BUTTON_CODE = `
     } catch (_) { return false; }
   }
 
-  function addDownloadButton() {
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // 表示されているか（高さ0・display:none は押しても効かない）
+  function visible(el) {
+    if (!el) return false;
+    const s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  // 「続きを読む / さらに読み込む」ボタンを押す
+  async function clickLoadMore() {
+    const sels = [
+      '#load-more-chapters', '.load-more', '.read-more',
+      '[id*="load-more"]', '[class*="load-more"]',
+      'button[onclick*="load"]', 'a[onclick*="load"]'
+    ];
+    for (const sel of sels) {
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        if (!visible(el) || el.disabled) continue;
+        const txt = (el.textContent || '').trim();
+        // 明らかに「読み込み」系でなければスキップ（誤爆防止）
+        if (txt && !/続き|もっと|さらに|次|読み込|load|more/i.test(txt) && !sel.includes('load-more')) continue;
+        try { el.click(); await sleep(600); return true; } catch (_) {}
+      }
+    }
+    return false;
+  }
+
+  // メイン: 最下部まで自動スクロールして、すべての画像を読み込ませる
+  async function autoScrollAll(setStatus) {
+    const STEP_WAIT = 280;      // 1回のスクロール後の待ち
+    const STABLE_LIMIT = 4;     // 高さ・画像数が N 回連続で変わらなければ終了
+    const MAX_LOOPS = 500;      // 無限スクロール暴走の安全弁
+
+    // 一度最下部 → 最上部 → 最下部 とすると、lazy-load が全発火しやすい
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    await sleep(200);
+    window.scrollTo(0, 0);
+    await sleep(200);
+
+    let lastH = 0, lastN = 0, stable = 0;
+
+    for (let loop = 0; loop < MAX_LOOPS; loop++) {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      await sleep(STEP_WAIT);
+
+      // 「続きを読む」があれば押す（高さが変わるので、stable カウントはリセットされる）
+      await clickLoadMore();
+
+      const h = document.documentElement.scrollHeight;
+      const n = document.querySelectorAll('img').length;
+
+      if (setStatus) {
+        const pct = Math.min(99, Math.round((loop / 30) * 100));
+        setStatus('ページを読み込み中... (' + pct + '%)');
+      }
+
+      if (h === lastH && n === lastN) {
+        stable++;
+        if (stable >= STABLE_LIMIT) break;
+      } else {
+        stable = 0; lastH = h; lastN = n;
+      }
+    }
+
+    // IntersectionObserver が発火しなかった画像への保険:
+    // data-src / data-original を src に強制反映
+    document.querySelectorAll('img[data-src], img[data-original]').forEach(img => {
+      const real = img.dataset.src || img.dataset.original;
+      if (real && img.getAttribute('src') !== real) {
+        try { img.setAttribute('src', real); } catch (_) {}
+      }
+    });
+
+    // すべての img が load 完了 or error になるまで待つ（最大15秒）
+    const imgs = Array.from(document.querySelectorAll('img'));
+    await Promise.all(imgs.map(img => {
+      if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+      return new Promise(res => {
+        const done = () => res();
+        img.addEventListener('load', done, { once: true });
+        img.addEventListener('error', done, { once: true });
+        setTimeout(done, 15000);
+      });
+    }));
+
+    // 収集前に一呼吸（img.src が実URLになっていないことがある）
+    await sleep(500);
+    window.scrollTo(0, 0);
+  }
+
+  // 画像候補を収集
+  function collect() {
+    const all = Array.from(document.querySelectorAll('img'));
+    const cands = all.filter(img => {
+      const src = img.dataset.src || img.dataset.original || img.src || '';
+      if (!src || src.startsWith('data:') || src.startsWith('blob:')) return false;
+      if (img.dataset.src || img.dataset.original) return true;
+      return img.naturalWidth >= 200 && img.naturalHeight >= 200;
+    });
+    const items = cands.map(img => {
+      const raw = img.dataset.src || img.dataset.original || img.src;
+      try {
+        const abs = new URL(raw, location.href);
+        if (abs.host === location.host) return { path: abs.pathname + abs.search };
+        return { url: abs.href };
+      } catch (_) { return null; }
+    }).filter(Boolean);
+    const seen = new Set();
+    const uniq = [];
+    items.forEach(it => {
+      const k = it.path || it.url;
+      if (seen.has(k)) return;
+      seen.add(k); uniq.push(it);
+    });
+    return uniq;
+  }
+
+  function addBtn() {
     if (!isReadPage()) return;
     if (document.getElementById('__zip_dl_btn')) return;
 
@@ -167,51 +237,36 @@ const DOWNLOAD_BUTTON_CODE = `
     btn.innerHTML = '📦 ZIPダウンロード';
     btn.style.cssText = [
       'position:fixed', 'bottom:20px', 'right:20px',
-      'z-index:2147483000',   // ★ 誤マッチ回避
+      'z-index:2147483000',
       'padding:12px 20px',
-      'background:#3b82f6', 'color:#fff', 'border:none',
+      'background:#be185d', 'color:#fff', 'border:none',
       'border-radius:8px', 'font-size:16px', 'font-weight:bold',
       'cursor:pointer', 'box-shadow:0 4px 12px rgba(0,0,0,.4)',
-      'font-family:sans-serif'
+      'font-family:system-ui,-apple-system,sans-serif'
     ].join(';');
+
+    const setStatus = (txt) => { btn.textContent = txt; };
 
     btn.onclick = async () => {
       if (!isReadPage()) { btn.remove(); return; }
+      if (btn.disabled) return;
       btn.disabled = true;
-      const originalText = '📦 ZIPダウンロード';
-      btn.textContent = '⏳ 画像を収集中...';
+      const original = '📦 ZIPダウンロード';
 
       try {
-        const allImgs = Array.from(document.querySelectorAll('img'));
-        const candidates = allImgs.filter(img => {
-          const src = img.dataset.src || img.dataset.original || img.src;
-          if (!src || src.startsWith('data:') || src.startsWith('blob:')) return false;
-          if (img.dataset.src || img.dataset.original) return true;
-          return img.naturalWidth >= 200 && img.naturalHeight >= 200;
-        });
+        // ① 自動で全部読み込ませる
+        await autoScrollAll(setStatus);
 
-        const items = candidates.map(img => {
-          const raw = img.dataset.src || img.dataset.original || img.src;
-          const abs = new URL(raw, location.href);
-          if (abs.host === location.host) return { path: abs.pathname + abs.search };
-          return { url: abs.href };
-        });
-
-        const seen = new Set();
-        const unique = items.filter(it => {
-          const k = it.path || it.url;
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        });
-
-        if (unique.length === 0) {
+        // ② 画像を収集
+        const items = collect();
+        if (items.length === 0) {
           alert('画像が見つかりませんでした');
-          btn.disabled = false; btn.textContent = originalText;
+          btn.disabled = false; btn.textContent = original;
           return;
         }
 
-        btn.textContent = '⏳ ' + unique.length + '枚取得中...';
+        // ③ サーバーへ送ってZIP化
+        setStatus('⏳ ' + items.length + '枚を取得中...');
         const u = new URL(location.href);
         const mangaId = (u.searchParams.get('id') || 'manga')
           .replace(/[\\\\/:*?"<>|]/g, '_').substring(0, 40);
@@ -220,49 +275,46 @@ const DOWNLOAD_BUTTON_CODE = `
         const resp = await fetch('/__download_zip', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: unique, title, referer: location.href })
+          body: JSON.stringify({ items, title, referer: location.href })
         });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
+        // ④ ダウンロード
         const blob = await resp.blob();
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = title + '.zip';
         document.body.appendChild(a);
         a.click();
-        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
 
-        btn.textContent = '✅ 完了!';
-        setTimeout(() => { btn.disabled = false; btn.textContent = originalText; }, 2500);
+        setStatus('✅ 完了! (' + items.length + '枚)');
+        setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 3000);
       } catch (e) {
         console.error('[ZIP]', e);
         alert('ダウンロード失敗: ' + e.message);
-        btn.disabled = false; btn.textContent = originalText;
+        btn.disabled = false; btn.textContent = original;
       }
     };
 
     document.body.appendChild(btn);
   }
 
-  function syncVisibility() {
-    const btn = document.getElementById('__zip_dl_btn');
-    if (!btn) { addDownloadButton(); return; }
-    btn.style.display = isReadPage() ? 'block' : 'none';
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', addBtn);
+  } else {
+    addBtn();
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      addDownloadButton();
-      setInterval(syncVisibility, 1500);
-    });
-  } else {
-    addDownloadButton();
-    setInterval(syncVisibility, 1500);
-  }
+  // SPA遷移対策（/read を外れたら消す、戻ったら再表示）
+  setInterval(() => {
+    const b = document.getElementById('__zip_dl_btn');
+    if (!b) { addBtn(); return; }
+    b.style.display = isReadPage() ? 'block' : 'none';
+  }, 1500);
 })();
 </script>
 `;
-
 // ==========================================
 // 3. 画像の拡張子判定（マジックバイト検出）
 // ==========================================
