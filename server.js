@@ -9,7 +9,6 @@ const app = express();
 // ==========================================
 const WORKER_CONFIGS = [
     "https://api-nemu.myproxy0108.workers.dev",
-    "https://mangarw-api.nemu1.workers.dev",
     "https://tuneninemui.nemu0001.workers.dev"
 ];
 
