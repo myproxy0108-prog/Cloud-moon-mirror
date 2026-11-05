@@ -94,14 +94,19 @@ const AD_DOMAINS = [
 ];
 
 // 全ページ共通：ブラウザ内で動く強力な広告クリーナー＋先読み
+// 全ページ共通：ブラウザ内で動く強力な広告クリーナー＋先読み
 const INJECT_CODE = `
 <style>
-  /* 広告枠を強制非表示 */
   iframe, .pop--excl, .bg-ssp-11557, [id*="bg-ssp"], [class*="ad-"],
   [style*="2147483647"], [style*="9999"], #toast {
     display: none !important; visibility: hidden !important; pointer-events: none !important;
   }
-  /* 続きを読むボタンを保護 */
+  /* ★ ダウンロードボタン保護（広告削除より優先） */
+  #__zip_dl_btn {
+    display: block !important;
+    visibility: visible !important;
+    pointer-events: auto !important;
+  }
   #load-more-chapters, .load-more, .read-more {
     display: block !important; visibility: visible !important; opacity: 1 !important;
     background-color: #3b82f6 !important; color: white !important;
@@ -109,12 +114,10 @@ const INJECT_CODE = `
 </style>
 <script>
   (function() {
-    // 1. ポップアップを殺す
     window.open = function() { return null; };
-
-    // 2. 動的な透明オーバーレイを監視して削除
     const nuke = () => {
       document.querySelectorAll('div, a').forEach(el => {
+        if (el.id === '__zip_dl_btn') return;
         const s = window.getComputedStyle(el);
         if (parseInt(s.zIndex) > 100 && (s.opacity === '0' || s.backgroundColor.includes('0)'))) {
           if(!el.innerText.trim()) el.remove();
@@ -123,8 +126,6 @@ const INJECT_CODE = `
       });
     };
     setInterval(nuke, 2000);
-
-    // 3. 画像の5枚先読み（高速化）
     const prefetch = () => {
       const imgs = Array.from(document.querySelectorAll('img[data-src]'));
       const obs = new IntersectionObserver((entries) => {
@@ -146,13 +147,9 @@ const INJECT_CODE = `
 </script>
 `;
 
-// ==========================================
-// 2b. /read?id=xxx 限定：ZIPダウンロードボタン
-// ==========================================
 const DOWNLOAD_BUTTON_CODE = `
 <script>
 (function() {
-  // ---- クライアント側でも /read?id=xxx を厳格チェック ----
   function isReadPage() {
     try {
       const u = new URL(location.href);
@@ -161,15 +158,17 @@ const DOWNLOAD_BUTTON_CODE = `
   }
 
   function addDownloadButton() {
-    if (!isReadPage()) return;             // 念のためガード
+    if (!isReadPage()) return;
     if (document.getElementById('__zip_dl_btn')) return;
 
     const btn = document.createElement('button');
     btn.id = '__zip_dl_btn';
+    btn.type = 'button';
     btn.innerHTML = '📦 ZIPダウンロード';
     btn.style.cssText = [
       'position:fixed', 'bottom:20px', 'right:20px',
-      'z-index:2147483647', 'padding:12px 20px',
+      'z-index:2147483000',   // ★ 誤マッチ回避
+      'padding:12px 20px',
       'background:#3b82f6', 'color:#fff', 'border:none',
       'border-radius:8px', 'font-size:16px', 'font-weight:bold',
       'cursor:pointer', 'box-shadow:0 4px 12px rgba(0,0,0,.4)',
@@ -177,14 +176,12 @@ const DOWNLOAD_BUTTON_CODE = `
     ].join(';');
 
     btn.onclick = async () => {
-      if (!isReadPage()) { btn.remove(); return; }  // 遷移後の誤爆防止
-
+      if (!isReadPage()) { btn.remove(); return; }
       btn.disabled = true;
       const originalText = '📦 ZIPダウンロード';
       btn.textContent = '⏳ 画像を収集中...';
 
       try {
-        // 候補画像を収集（data-src優先、なければサイズでフィルタ）
         const allImgs = Array.from(document.querySelectorAll('img'));
         const candidates = allImgs.filter(img => {
           const src = img.dataset.src || img.dataset.original || img.src;
@@ -193,17 +190,13 @@ const DOWNLOAD_BUTTON_CODE = `
           return img.naturalWidth >= 200 && img.naturalHeight >= 200;
         });
 
-        // 相対URLはプロキシ経由、外部は直接取得する形式に変換
         const items = candidates.map(img => {
           const raw = img.dataset.src || img.dataset.original || img.src;
           const abs = new URL(raw, location.href);
-          if (abs.host === location.host) {
-            return { path: abs.pathname + abs.search };
-          }
+          if (abs.host === location.host) return { path: abs.pathname + abs.search };
           return { url: abs.href };
         });
 
-        // 重複除去
         const seen = new Set();
         const unique = items.filter(it => {
           const k = it.path || it.url;
@@ -219,8 +212,6 @@ const DOWNLOAD_BUTTON_CODE = `
         }
 
         btn.textContent = '⏳ ' + unique.length + '枚取得中...';
-
-        // ファイル名は manga_id から生成（例: read?id=12345 → manga_12345.zip）
         const u = new URL(location.href);
         const mangaId = (u.searchParams.get('id') || 'manga')
           .replace(/[\\\\/:*?"<>|]/g, '_').substring(0, 40);
@@ -231,7 +222,6 @@ const DOWNLOAD_BUTTON_CODE = `
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: unique, title, referer: location.href })
         });
-
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
         const blob = await resp.blob();
@@ -243,10 +233,7 @@ const DOWNLOAD_BUTTON_CODE = `
         setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 
         btn.textContent = '✅ 完了!';
-        setTimeout(() => {
-          btn.disabled = false;
-          btn.textContent = originalText;
-        }, 2500);
+        setTimeout(() => { btn.disabled = false; btn.textContent = originalText; }, 2500);
       } catch (e) {
         console.error('[ZIP]', e);
         alert('ダウンロード失敗: ' + e.message);
@@ -257,7 +244,6 @@ const DOWNLOAD_BUTTON_CODE = `
     document.body.appendChild(btn);
   }
 
-  // SPA遷移（pushState等）で /read を外れたら隠し、戻ったら再表示
   function syncVisibility() {
     const btn = document.getElementById('__zip_dl_btn');
     if (!btn) { addDownloadButton(); return; }
